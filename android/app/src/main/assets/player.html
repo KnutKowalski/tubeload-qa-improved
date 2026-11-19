@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>TubeLoad QA Android</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+    }
+
+    #container, #player {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="container"></div>
+
+  <script>
+    var player = null;
+    var metricsTimer = null;
+    var timers = [];
+
+    var cfg = null;
+    var kind = null;
+    var videoId = null;
+    var playlistId = null;
+
+    var loops = 0;
+    var finished = false;
+    var cycleCheckPending = false;
+
+    var ytApiReady = false;
+    var pendingStart = null;
+    var playbackWatchdog = null;
+
+    // Harte Obergrenzen, unabhängig von dem, was die App übergibt.
+    var HARD_MAX_LOOPS = 10;
+    var HARD_MAX_RUNTIME_SEC = 4 * 60 * 60;
+    var PLAYLIST_ADVANCE_GRACE_MS = 8000;
+
+    var ALLOWED_HOST = /^(www\.|m\.|music\.)?youtube\.com$|^youtu\.be$/;
+
+    var YT_ERROR_TEXT = {
+      2: "Ungültige Videoparameter",
+      5: "HTML5-Player-Fehler",
+      100: "Video wurde entfernt oder ist privat",
+      101: "Einbetten dieses Videos ist nicht erlaubt",
+      150: "Einbetten dieses Videos ist nicht erlaubt"
+    };
+
+    // Statusmeldungen gehen über den ursprungsgebundenen Kanal der App
+    // (WebViewCompat.addWebMessageListener, Objekt "TubeloadBridge").
+    function log(obj) {
+      obj.ts = Date.now();
+
+      var text = JSON.stringify(obj);
+
+      try {
+        if (window.TubeloadBridge && window.TubeloadBridge.postMessage) {
+          window.TubeloadBridge.postMessage(text);
+          return;
+        }
+      } catch (e) {}
+
+      console.log(text);
+    }
+
+    // Alle Timer laufen über later(), damit cleanup() sie vollständig abbrechen kann.
+    // (Früher feuerten alte Timer nach einem Neustart auf den neuen Player.)
+    function later(fn, ms) {
+      var id = setTimeout(function () {
+        timers = timers.filter(function (t) { return t !== id; });
+        fn();
+      }, ms);
+
+      timers.push(id);
+
+      return id;
+    }
+
+    function clearTimers() {
+      timers.forEach(function (t) { clearTimeout(t); });
+      timers = [];
+    }
+
+    function clearPlaybackWatchdog() {
+      if (playbackWatchdog) {
+        clearTimeout(playbackWatchdog);
+        playbackWatchdog = null;
+      }
+    }
+
+    function startPlaybackWatchdog() {
+      clearPlaybackWatchdog();
+
+      playbackWatchdog = setTimeout(function () {
+        try {
+          if (player && player.getPlayerState() !== YT.PlayerState.PLAYING) {
+            log({
+              state: "not_playing",
+              detail: "Keine Wiedergabe innerhalb von 20 Sekunden (Netzwerk, Embedding-Sperre oder Player-Fehler prüfen)."
+            });
+          }
+        } catch (e) {}
+      }, 20000);
+    }
+
+    function parseYouTubeUrl(raw) {
+      try {
+        var u = new URL(raw);
+
+        if (u.protocol !== "https:" || !ALLOWED_HOST.test(u.hostname)) {
+          return null;
+        }
+
+        var v = u.searchParams.get("v");
+        var list = u.searchParams.get("list");
+
+        if (v) {
+          return {
+            kind: list ? "playlist" : "video",
+            videoId: v,
+            playlistId: list || null
+          };
+        }
+
+        if (u.hostname === "youtu.be") {
+          var idShort = u.pathname.slice(1).split("/")[0];
+          if (idShort) {
+            return { kind: "video", videoId: idShort, playlistId: null };
+          }
+        }
+
+        if (u.pathname.indexOf("/playlist") === 0 && list) {
+          return { kind: "playlist", videoId: null, playlistId: list };
+        }
+
+        var ch = u.pathname.match(/\/channel\/(UC[0-9A-Za-z_-]{22})/);
+        if (ch) {
+          // Kanal -> "Uploads"-Playlist des Kanals
+          return { kind: "playlist", videoId: null, playlistId: "UU" + ch[1].slice(2) };
+        }
+
+        if (u.pathname.indexOf("/shorts/") === 0) {
+          var shortsId = u.pathname.split("/")[2];
+          if (shortsId) {
+            return { kind: "video", videoId: shortsId, playlistId: null };
+          }
+        }
+
+        if (u.pathname.indexOf("/embed/") === 0) {
+          var embedId = u.pathname.split("/")[2];
+          if (embedId) {
+            return { kind: "video", videoId: embedId, playlistId: null };
+          }
+        }
+      } catch (e) {
+        log({ state: "error", error: "invalid_url", detail: String(e) });
+      }
+
+      return null;
+    }
+
+    function stateName(state) {
+      if (!window.YT) return String(state);
+
+      switch (state) {
+        case YT.PlayerState.UNSTARTED:
+          return "unstarted";
+        case YT.PlayerState.ENDED:
+          return "ended";
+        case YT.PlayerState.PLAYING:
+          return "playing";
+        case YT.PlayerState.PAUSED:
+          return "paused";
+        case YT.PlayerState.BUFFERING:
+          return "buffering";
+        case YT.PlayerState.CUED:
+          return "cued";
+        default:
+          return String(state);
+      }
+    }
+
+    function startMetricsLoop() {
+      if (metricsTimer) clearInterval(metricsTimer);
+
+      metricsTimer = setInterval(function () {
+        if (!player) return;
+
+        try {
+          // Gemessen werden Zustand, Position und Puffer. Die Qualität wählt man im
+          // Zahnrad-Menü des Players (controls: 1); per IFrame-API lässt sie sich nicht
+          // setzen (setPlaybackQuality ist laut Google-Dokumentation seit 24.10.2019 wirkungslos).
+          log({
+            state: stateName(player.getPlayerState()),
+            currentTime: player.getCurrentTime(),
+            duration: player.getDuration(),
+            loadedFraction: player.getVideoLoadedFraction(),
+            loop: loops + 1,
+            kind: kind,
+            videoId: videoId,
+            playlistId: playlistId
+          });
+        } catch (e) {
+          log({ state: "error", error: String(e) });
+        }
+      }, 1000);
+    }
+
+    // Ein kompletter Durchlauf (Video bzw. gesamte Playlist) ist beendet.
+    function cycleDone() {
+      if (finished) return;
+
+      loops++;
+
+      if (!cfg.repeat || loops >= cfg.maxLoops) {
+        finish("completed");
+        return;
+      }
+
+      // Feste Pause vor der Wiederholung.
+      later(function () {
+        if (!player || finished) return;
+
+        try {
+          if (kind === "playlist") {
+            player.loadPlaylist({ listType: "playlist", list: playlistId, index: 0 });
+          } else {
+            player.seekTo(0, true);
+          }
+
+          player.playVideo();
+        } catch (e) {
+          log({ state: "error", error: String(e) });
+        }
+      }, 2000);
+    }
+
+    function onEnded() {
+      if (finished) return;
+
+      if (kind !== "playlist") {
+        cycleDone();
+        return;
+      }
+
+      // ENDED feuert bei Playlists nach JEDEM Video, und die API springt danach von
+      // selbst zum nächsten Eintrag. Erst wenn der Player nach der Frist noch im
+      // Zustand "beendet" ist, war es das letzte Video der Playlist.
+      if (cycleCheckPending) return;
+
+      cycleCheckPending = true;
+
+      later(function () {
+        cycleCheckPending = false;
+
+        try {
+          if (player && player.getPlayerState() === YT.PlayerState.ENDED) {
+            cycleDone();
+          }
+        } catch (e) {
+          log({ state: "error", error: String(e) });
+        }
+      }, PLAYLIST_ADVANCE_GRACE_MS);
+    }
+
+    function cleanup() {
+      try {
+        clearPlaybackWatchdog();
+        clearTimers();
+        if (metricsTimer) clearInterval(metricsTimer);
+        if (player && player.destroy) player.destroy();
+      } catch (e) {}
+
+      metricsTimer = null;
+      player = null;
+      cycleCheckPending = false;
+    }
+
+    // reason: "completed" | "max_runtime" | "stopped"
+    function finish(reason) {
+      if (finished) return;
+
+      finished = true;
+      cleanup();
+      log({ state: reason, loops: loops });
+    }
+
+    window.stopPlayback = function () {
+      finish("stopped");
+    };
+
+    function createPlayer(config) {
+      cleanup();
+
+      loops = 0;
+      finished = false;
+
+      cfg = {
+        url: config.url,
+        repeat: !!config.repeat,
+        mute: config.mute !== false,
+        maxLoops: Math.max(1, Math.min(Number(config.maxLoops) || 3, HARD_MAX_LOOPS)),
+        maxRuntimeSec: Math.max(30, Math.min(Number(config.maxRuntimeSec) || 1800, HARD_MAX_RUNTIME_SEC))
+      };
+
+      var parsed = parseYouTubeUrl(cfg.url);
+
+      if (!parsed) {
+        log({
+          state: "error",
+          error: "unsupported_url",
+          hint: "Unterstützt werden https-Video-, Playlist- und channel/UC...-URLs von YouTube."
+        });
+        return;
+      }
+
+      kind = parsed.kind;
+      videoId = parsed.videoId;
+      playlistId = parsed.playlistId;
+
+      document.getElementById("container").innerHTML = '<div id="player"></div>';
+
+      // Zeitlimit des gesamten Tests.
+      later(function () {
+        finish("max_runtime");
+      }, cfg.maxRuntimeSec * 1000);
+
+      var playerVars = {
+        autoplay: 1,
+        // Eingeblendete Steuerelemente: darüber (Zahnrad) lässt sich die Qualität
+        // wie in der YouTube-App von Auto über 144p bis 1080p/4K wählen.
+        controls: 1,
+        disablekb: 1,
+        modestbranding: 1,
+        playsinline: 1,
+        rel: 0,
+        fs: 0,
+        iv_load_policy: 3,
+        enablejsapi: 1
+      };
+
+      var options = {
+        events: {
+          onReady: function (e) {
+            log({
+              state: "ready",
+              kind: kind,
+              videoId: videoId,
+              playlistId: playlistId
+            });
+
+            if (cfg.mute) {
+              try {
+                e.target.mute();
+              } catch (err) {}
+            }
+
+            try {
+              e.target.playVideo();
+            } catch (err) {}
+
+            startMetricsLoop();
+            startPlaybackWatchdog();
+          },
+
+          onStateChange: function (e) {
+            if (finished) return;
+
+            if (e.data === YT.PlayerState.PLAYING) {
+              clearPlaybackWatchdog();
+            }
+
+            log({
+              state: stateName(e.data),
+              kind: kind,
+              videoId: videoId,
+              playlistId: playlistId
+            });
+
+            if (e.data === YT.PlayerState.ENDED) {
+              onEnded();
+            }
+          },
+
+          onPlaybackQualityChange: function (e) {
+            log({ state: "quality_change", quality: e.data });
+          },
+
+          onError: function (e) {
+            clearPlaybackWatchdog();
+
+            log({
+              state: "error",
+              error: e.data,
+              detail: YT_ERROR_TEXT[e.data] || "Unbekannter Fehler"
+            });
+          }
+        }
+      };
+
+      if (kind === "playlist") {
+        playerVars.listType = "playlist";
+        playerVars.list = playlistId;
+      } else {
+        options.videoId = videoId;
+      }
+
+      options.playerVars = playerVars;
+
+      player = new YT.Player("player", options);
+    }
+
+    window.startTest = function (config) {
+      if (!ytApiReady) {
+        pendingStart = config;
+        return;
+      }
+
+      createPlayer(config);
+    };
+
+    window.onYouTubeIframeAPIReady = function () {
+      ytApiReady = true;
+
+      if (pendingStart) {
+        createPlayer(pendingStart);
+        pendingStart = null;
+      }
+    };
+
+    setTimeout(function () {
+      if (!ytApiReady) {
+        log({
+          state: "error",
+          error: "api_timeout",
+          detail: "YouTube-Iframe-API konnte nicht geladen werden. Internetverbindung prüfen."
+        });
+      }
+    }, 15000);
+  </script>
+
+  <script src="https://www.youtube.com/iframe_api"></script>
+</body>
+</html>
